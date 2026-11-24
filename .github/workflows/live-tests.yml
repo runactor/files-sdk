@@ -34,7 +34,7 @@ jobs:
         run: bun install
 
       - name: Build SDK
-        run: bun run build --filter files-sdk
+        run: bun run build --filter ./packages/files-sdk
 
       - name: Run live tests
         working-directory: packages/files-sdk

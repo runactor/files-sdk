@@ -9,6 +9,12 @@ import { isObject, isString } from "../internal/is.js";
 // try each depth and keep the manifest that is actually this package's.
 const MANIFEST_CANDIDATES = ["../package.json", "../../package.json"];
 
+// The package as published upstream, and as the runactor fork publishes it.
+const PACKAGE_NAMES: ReadonlySet<string> = new Set([
+  "files-sdk",
+  "@runactor/files-sdk",
+]);
+
 /**
  * The files-sdk version, read from the package's own `package.json` relative
  * to `from` (this module's URL by default). Throws if neither candidate
@@ -26,7 +32,8 @@ export const readPackageVersion = (from: string = import.meta.url): string => {
     if (
       isObject(manifest) &&
       "name" in manifest &&
-      manifest.name === "files-sdk" &&
+      isString(manifest.name) &&
+      PACKAGE_NAMES.has(manifest.name) &&
       "version" in manifest &&
       isString(manifest.version)
     ) {

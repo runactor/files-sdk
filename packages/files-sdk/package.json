@@ -1,6 +1,6 @@
 {
-  "name": "files-sdk",
-  "version": "3.2.1",
+  "name": "@runactor/files-sdk",
+  "version": "3.2.1-runactor.0",
   "description": "Unified storage SDK for object/blob backends.",
   "keywords": [
     "azure",
@@ -387,6 +387,9 @@
       "types": "./dist/loader/index.d.ts",
       "import": "./dist/loader/index.js"
     }
+  },
+  "publishConfig": {
+    "registry": "https://runactor-npm.methodactor.workers.dev"
   },
   "scripts": {
     "build": "bun run scripts/build.ts",

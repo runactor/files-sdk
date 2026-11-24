@@ -57,7 +57,7 @@ jobs:
         run: bun test
 
       - name: Build SDK
-        run: bun run build --filter files-sdk
+        run: bun run build --filter ./packages/files-sdk
 
       - name: Create Release PR or Publish to NPM
         id: changesets

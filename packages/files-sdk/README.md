@@ -1,3 +1,5 @@
+> **`@runactor/files-sdk`** is runactor's fork of [`files-sdk`](https://github.com/haydenbleasel/files-sdk): its `s3Fetch()` engine adds multipart uploads, conditional create/replace/copy, and the object `version`, and its R2 binding adds conditional writes through `onlyIf`.
+
 # Files SDK
 
 A unified storage SDK for object and blob backends. One small, honest API. Web-standard I/O. An escape hatch when you need the native client.

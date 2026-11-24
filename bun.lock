@@ -27,7 +27,7 @@
         "class-variance-authority": "^0.7.1",
         "cn": "^0.4.0",
         "cookie": "^2.0.1",
-        "files-sdk": "workspace:*",
+        "files-sdk": "workspace:@runactor/files-sdk@*",
         "js-yaml": "^5.4.1",
         "lucide-react": "^1.53.0",
         "motion": "^13.2.0",
@@ -47,8 +47,8 @@
       },
     },
     "packages/files-sdk": {
-      "name": "files-sdk",
-      "version": "3.2.0",
+      "name": "@runactor/files-sdk",
+      "version": "3.2.1-runactor.0",
       "bin": {
         "files": "./dist/cli/index.js",
       },
@@ -2214,7 +2214,7 @@
 
     "filelist": ["filelist@1.0.6", "", { "dependencies": { "minimatch": "^5.0.1" } }, "sha512-5giy2PkLYY1cP39p17Ech+2xlpTRL9HLspOfEgm0L6CwBXBTgsK5ou0JtzYuepxkaQ/tvhCFIJ5uXo0OrM2DxA=="],
 
-    "files-sdk": ["files-sdk@workspace:packages/files-sdk"],
+    "files-sdk": ["@runactor/files-sdk@workspace:packages/files-sdk"],
 
     "fill-range": ["fill-range@7.1.1", "", { "dependencies": { "to-regex-range": "^5.0.1" } }, "sha512-YsGpe3WHLK8ZYi4tWDg2Jy3ebRz2rXowDxnld4bkQB00cc/1Zw9AWnC0i9ztDJitivtQvaI9KaLyKrc+hBW0yg=="],
 
@@ -3539,6 +3539,8 @@
     "@rollup/pluginutils/@types/estree": ["@types/estree@1.0.8", "", {}, "sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w=="],
 
     "@rollup/pluginutils/picomatch": ["picomatch@4.0.4", "", {}, "sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A=="],
+
+    "@runactor/files-sdk": ["@runactor/files-sdk@workspace:packages/files-sdk"],
 
     "@scalar/json-magic/undici": ["undici@7.29.1", "", {}, "sha512-RYONW2MeafgYlkVOKYKkA/Ag7BmXqgIWCa8t1m0JcxrQg9pI9lEqRhAOruOBCbAohOa/gkCF+iPi9hrgvTzu6Q=="],
 
