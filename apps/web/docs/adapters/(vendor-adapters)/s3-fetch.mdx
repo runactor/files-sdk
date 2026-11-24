@@ -17,7 +17,7 @@ files-sdk
 
 [`files-sdk/s3`](/docs/adapters/s3) and the S3-compatible wrappers built on it ([MinIO](/docs/adapters/minio), [Tigris](/docs/adapters/tigris), [Wasabi](/docs/adapters/wasabi), ...) import `@aws-sdk/client-s3`. On a browser-targeted bundle that SDK's XML parser needs a `DOMParser`, which Cloudflare Workers don't provide - every `list()` or error-body parse throws `DOMParser is not defined` at runtime. `s3Fetch()` is the same engine that backs [`r2()`'s fetch client](/docs/adapters/r2#lightweight-fetch-client), pointed at an endpoint of your choosing, for exactly those runtimes.
 
-Outside Workers and edge runtimes prefer `files-sdk/s3`: it carries the full surface (multipart and resumable uploads, batched deletes, byte-level progress, the AWS credential chain) that this engine trades away for size.
+Outside Workers and edge runtimes prefer `files-sdk/s3`: it carries the full surface (resumable uploads, batched deletes, byte-level progress, the AWS credential chain) that this engine trades away for size.
 
 ## Usage
 
@@ -65,13 +65,14 @@ Only the endpoint's origin is used; a path component is dropped. Front the servi
 
 Same coverage and limits as the R2 fetch client: `upload`, `download` (including [ranges](/docs/api/download#byte-ranges)), `head`, `exists`, `delete`, `list` (including `delimiter` folding), server-side `copy`, presigned `url()`, and `signedUploadUrl()` are all covered. Against `files-sdk/s3`:
 
-- `ReadableStream` bodies are buffered in memory before a single PUT (a lone PUT needs a `Content-Length`, and single-request uploads cap at 5&nbsp;GB). Inside a Worker that buffering counts against the isolate's memory limit.
-- `multipart` and resumable (`control`) uploads throw instead of engaging the S3 multipart API.
+- A `ReadableStream` body that ends within one part (5&nbsp;MiB, or `multipart.partSize`) goes up as a single PUT; a longer one goes up as a multipart upload in equal parts, holding at most `partSize × (concurrency + 1)` bytes. `multipart` splits a buffered body the same way. A failed upload is aborted.
+- Resumable (`control`) uploads throw.
 - Bulk deletes fan out as per-key `delete()` calls instead of batched `DeleteObjects` requests. On Workers each call is a subrequest, so chunk large bulk deletes to stay under the per-invocation subrequest cap.
 - `signedUploadUrl()` returns a presigned PUT; `maxSize` and a positive `minSize` throw because enforcing either needs a presigned POST policy this engine doesn't implement. Enforce upload caps at your application gateway instead.
 - Keys containing `.` or `..` path segments are rejected - URL normalization would silently sign a request for a different key.
 - Byte-level `onProgress` reporting falls back to the SDK's generic reporting.
-- No provider-native [conditional operations](/docs/conditional-operations).
+- [Conditional operations](/docs/conditional-operations) cover create, replace, and copy (no exact reads or conditional deletes). They are on for an AWS endpoint and off elsewhere unless `conditional: true` is passed. A stream body past one part carries the predicate on `CompleteMultipartUpload`. An endpoint that answers the headers with `501` (Backblaze B2) rejects with `Unsupported`.
+- On a versioned bucket, `upload()`, `head()`, and `download()` report the object's `version` (`x-amz-version-id`), and the adapter exposes its `endpoint` origin and `forcePathStyle` next to `raw`.
 - `files.raw` is the aws4fetch `AwsClient`, not an `S3Client`.
 
 S3's own [limits](/docs/adapters/s3#limits) apply here too: presigned URLs live at most 7 days (a longer `expiresIn` throws), and `copy()` is a single `CopyObject` request up to 5 GiB, past which it switches to a server-side multipart copy (`UploadPartCopy`).
@@ -87,7 +88,7 @@ S3's own [limits](/docs/adapters/s3#limits) apply here too: presigned URLs live 
 
 | Method | Status | Notes |
 | --- | :-: | --- |
-| `upload` | ⚠️ | Single PUT - `ReadableStream` bodies are buffered in memory first, and `multipart` / resumable `control` uploads throw. |
+| `upload` | ⚠️ | A stream past one part, or `multipart`, goes up as a multipart upload; resumable `control` uploads throw. |
 | `download` | ✅ |  |
 | `delete` | ✅ | Bulk deletes fan out per key (no batched `DeleteObjects`). |
 | `list` | ⚠️ | The S3 list API returns no per-object `Content-Type`, so `contentType` is inferred from the key's extension (`application/octet-stream` when unknown). Use `head()` for the stored value. |
@@ -97,4 +98,4 @@ S3's own [limits](/docs/adapters/s3#limits) apply here too: presigned URLs live 
 | `copy` | ✅ |  |
 | `url` | ✅ |  |
 | `signedUploadUrl` | ⚠️ | PUT URL only - `maxSize` and a positive `minSize` throw (no presigned POST policy). |
-| conditional operations | ❌ | Not advertised on this engine. |
+| conditional operations | ⚠️ | Create, replace, and copy, with `conditional: true` (default on AWS). |

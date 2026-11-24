@@ -55,8 +55,8 @@ Prefer this over pointing the generic [`s3Fetch()`](/docs/adapters/s3-fetch) at 
 
 The fetch client covers `upload`, `download` (including [ranges](/docs/api/download#byte-ranges)), `head`, `exists`, `delete`, `list` (including `delimiter` folding), server-side `copy`, presigned `url()`, and `signedUploadUrl()`. Trade-offs against the `"aws-sdk"` client:
 
-- `ReadableStream` bodies are buffered in memory before a single PUT (a lone PUT needs a `Content-Length`, and single-request uploads cap at 5&nbsp;GB).
-- `multipart` and resumable (`control`) uploads throw instead of engaging the S3 multipart API.
+- A `ReadableStream` body that ends within one part (5&nbsp;MiB, or `multipart.partSize`) goes up as a single PUT; a longer one goes up as a multipart upload in equal parts, holding at most `partSize × (concurrency + 1)` bytes. `multipart` splits a buffered body the same way. A failed upload is aborted.
+- Resumable (`control`) uploads throw.
 - Bulk deletes fan out as per-key `delete()` calls instead of batched `DeleteObjects` requests. On Workers each call is a subrequest, so chunk large bulk deletes to stay under the per-invocation subrequest cap.
 - `signedUploadUrl()` returns a presigned PUT; `maxSize` and a positive `minSize` throw because enforcing either needs a presigned POST policy this engine doesn't implement.
 - Keys containing `.` or `..` path segments are rejected - URL normalization would silently sign a request for a different key.
@@ -95,7 +95,7 @@ Inside Cloudflare Workers the fetch client is the default. The `"aws-sdk"` clien
 
 | Method | Status | Notes |
 | --- | :-: | --- |
-| `upload` | ⚠️ | Single PUT - `ReadableStream` bodies are buffered in memory first, and `multipart` / resumable `control` uploads throw. Multipart needs the `"aws-sdk"` client, which runs on Workers only with a `DOMParser` polyfill. |
+| `upload` | ⚠️ | A stream past one part, or `multipart`, goes up as a multipart upload; resumable `control` uploads throw. |
 | `download` | ✅ |  |
 | `delete` | ✅ | Bulk deletes fan out per key (no batched `DeleteObjects`). |
 | `list` | ⚠️ | The S3 list API returns no per-object `Content-Type`, so `contentType` is inferred from the key's extension (`application/octet-stream` when unknown). Use `head()` for the stored value. |

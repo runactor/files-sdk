@@ -1,9 +1,9 @@
-import type { AwsClient } from "aws4fetch";
-
-import type { Adapter } from "../index.js";
 import { readEnv } from "../internal/env.js";
 import { FilesError } from "../internal/errors.js";
 import { s3FetchAdapter } from "../internal/s3-fetch.js";
+import type { S3FetchAdapter } from "../internal/s3-fetch.js";
+
+export type { S3FetchAdapter } from "../internal/s3-fetch.js";
 
 // The public home of the aws4fetch-signed S3 engine that also powers r2()'s
 // `client: "fetch"` mode and hybrid signing. `files-sdk/s3` statically imports
@@ -11,8 +11,8 @@ import { s3FetchAdapter } from "../internal/s3-fetch.js";
 // `DOMParser` on browser-targeted bundles — absent on Cloudflare Workers — so
 // Workers, Deno Deploy, and browser-adjacent runtimes talking to AWS S3, MinIO,
 // Tigris, or any other S3-compatible endpoint reach for this entry instead.
-// Same coverage and trade-offs as r2's fetch client: single-PUT uploads,
-// no multipart/resumable, per-key bulk deletes, no presigned POST policies.
+// Same coverage and trade-offs as r2's fetch client: multipart uploads but no
+// resumable sessions, per-key bulk deletes, no presigned POST policies.
 
 export interface S3FetchAdapterOptions {
   /** Bucket name. All operations are scoped to it. */
@@ -30,6 +30,17 @@ export interface S3FetchAdapterOptions {
    * signature; most ignore it for routing.
    */
   region?: string;
+  /**
+   * Expose the native conditional primitives: `upload({ condition })` as
+   * `If-None-Match: *` (create) or `If-Match` (replace), on a single PUT or
+   * on the CompleteMultipartUpload of a stream body past one part, and
+   * `copy({ condition })` as a CopyObject pinned to the source's ETag.
+   * Defaults to `true` only for an AWS endpoint (`amazonaws.com`,
+   * `amazonaws.com.cn`); set it for an S3-compatible service you know honors
+   * the headers (R2 does; Backblaze B2 answers them `501`, which surfaces as
+   * `Unsupported`).
+   */
+  conditional?: boolean;
   /**
    * Static credentials. Falls back to `AWS_ACCESS_KEY_ID`; required if that
    * env var isn't set. No credential chain — there is no IAM role, shared
@@ -76,8 +87,6 @@ export interface S3FetchAdapterOptions {
   fetch?: (request: Request) => Promise<Response>;
 }
 
-export type S3FetchAdapter = Adapter<AwsClient> & { readonly bucket: string };
-
 export const s3Fetch = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
   const accessKeyId = opts.accessKeyId ?? readEnv("AWS_ACCESS_KEY_ID");
   const secretAccessKey =
@@ -109,6 +118,7 @@ export const s3Fetch = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
   return s3FetchAdapter({
     accessKeyId,
     bucket: opts.bucket,
+    ...(opts.conditional !== undefined && { conditional: opts.conditional }),
     ...(opts.defaultUrlExpiresIn !== undefined && {
       defaultUrlExpiresIn: opts.defaultUrlExpiresIn,
     }),

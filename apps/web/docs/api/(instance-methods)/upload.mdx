@@ -30,7 +30,7 @@ const replaced = await files.upload("reports/q3.json", nextBody, {
 });
 ```
 
-Conditional uploads return a non-optional ETag. They are not available for array, multipart, resumable, or signed-upload paths; the initial S3 implementation also rejects `ReadableStream` bodies before I/O, so buffer to a `Blob` or `Uint8Array` first. See [Conditional operations](/docs/conditional-operations) for capabilities, plugin behavior, and ambiguous retry outcomes.
+Conditional uploads return a non-optional ETag. They are not available for array, multipart, resumable, or signed-upload paths; the `s3()` engine also rejects `ReadableStream` bodies before I/O, so buffer to a `Blob` or `Uint8Array` first (the `s3Fetch()` engine accepts them, carrying the predicate on `CompleteMultipartUpload` past one part). See [Conditional operations](/docs/conditional-operations) for capabilities, plugin behavior, and ambiguous retry outcomes.
 
 ## Options
 
@@ -82,7 +82,7 @@ await files.upload("backups/db.tar", stream, {
 - **GCS** and **Firebase Storage** switch to a resumable upload; `partSize` maps to the chunk size.
 - **Azure Blob** already splits large bodies into parallel blocks; `multipart` only tunes the block size and concurrency.
 - **Dropbox** streams `ReadableStream` bodies through its upload session chunk-by-chunk, so a large stream is never buffered whole; `partSize` (rounded to a 4 MiB multiple) tunes the chunk size.
-- Other adapters already stream natively or only accept a fully-buffered body, so they ignore the option. The exception is the `fetch` S3 engine (`s3Fetch()`, and R2 / MinIO / RustFS with `client: "fetch"`), which has no multipart path and throws `Unsupported`.
+- Other adapters already stream natively or only accept a fully-buffered body, so they ignore the option. The `fetch` S3 engine (`s3Fetch()`, and R2 / MinIO / RustFS with `client: "fetch"`) runs its own multipart path without `@aws-sdk/lib-storage`: a stream past one part uses it automatically, and `multipart` splits a buffered body.
 
 ## Pause and resume
 

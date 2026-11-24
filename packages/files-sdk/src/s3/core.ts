@@ -55,7 +55,10 @@ import {
   isAwsEndpoint,
   isAwsHost,
   isUnsatisfiableRange,
+  assertCanonicalEtag,
   mayBeCopySizeRefusal,
+  normalizeConditionalResponseEtag,
+  quoteCanonicalEtag,
 } from "./shared.js";
 
 /**
@@ -193,67 +196,6 @@ const stripEtag = (etag: string | undefined): string | undefined => {
   }
   return etag.replaceAll(/^"+|"+$/gu, "");
 };
-
-// Conditional requests accept one strong entity tag, not an HTTP list or
-// wildcard. Keep the adapter boundary strict even when callers invoke the
-// optional primitive directly instead of going through `Files` validation.
-const CANONICAL_ETAG = /^(?!\*$)(?!W\/)[\u0021\u0023-\u002B\u002D-\u007E]+$/u;
-const MAX_ETAG_LENGTH = 1024;
-
-const assertCanonicalEtag = (etag: string): string => {
-  if (etag.length > MAX_ETAG_LENGTH || !CANONICAL_ETAG.test(etag)) {
-    throw new FilesError(
-      "Invalid",
-      "s3 adapter: conditional ETags must be canonical bare strong values"
-    );
-  }
-  return etag;
-};
-
-const quoteCanonicalEtag = (etag: string): string =>
-  `"${assertCanonicalEtag(etag)}"`;
-
-function normalizeConditionalResponseEtag(
-  etag: string | undefined,
-  operation: string,
-  required: true
-): string;
-function normalizeConditionalResponseEtag(
-  etag: string | undefined,
-  operation: string,
-  required: false
-): string | undefined;
-function normalizeConditionalResponseEtag(
-  etag: string | undefined,
-  operation: string,
-  required: boolean
-): string | undefined {
-  if (etag === undefined) {
-    if (required) {
-      throw new FilesError(
-        "Provider",
-        `S3 returned no ETag after ${operation}; the object may already have been committed`,
-        undefined,
-        { permanent: true }
-      );
-    }
-    return;
-  }
-  const bare =
-    etag.length >= 2 && etag.startsWith('"') && etag.endsWith('"')
-      ? etag.slice(1, -1)
-      : etag;
-  try {
-    return assertCanonicalEtag(bare);
-  } catch (error) {
-    throw new FilesError(
-      "Provider",
-      `S3 returned an invalid ETag after ${operation}`,
-      error,
-      { permanent: true }
-    );
-  }
-}
 
 const abortOptions = (signal: AbortSignal | undefined) =>
   signal ? { abortSignal: signal } : undefined;

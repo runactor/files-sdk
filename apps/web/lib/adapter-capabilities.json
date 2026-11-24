@@ -722,9 +722,9 @@
   "s3-fetch": {
     "cacheControl": true,
     "conditional": {
-      "create": false,
+      "create": true,
       "delete": false,
-      "replace": false
+      "replace": true
     },
     "delimiter": "any",
     "events": "s3",

@@ -586,8 +586,22 @@ const fakeBinding = () => {
       opts?: {
         httpMetadata?: { contentType?: string };
         customMetadata?: Record<string, string>;
+        onlyIf?: Headers | { etagMatches?: string };
       }
     ) {
+      // Like the binding: a condition that fails answers null, writes nothing.
+      const current = map.get(key);
+      const onlyIf = opts?.onlyIf;
+      if (
+        (onlyIf instanceof Headers &&
+          onlyIf.get("if-none-match") === "*" &&
+          current) ||
+        (onlyIf &&
+          !(onlyIf instanceof Headers) &&
+          onlyIf.etagMatches !== current?.etag)
+      ) {
+        return null;
+      }
       let bytes: Uint8Array;
       if (typeof body === "string") {
         bytes = new TextEncoder().encode(body);
@@ -1720,6 +1734,40 @@ describe("r2 adapter — Workers binding path", () => {
     const buffer = await got.arrayBuffer();
     expect(buffer.byteLength).toBe(0);
   });
+
+  test("conditional writes go through the binding's onlyIf; a failed condition is Conflict", async () => {
+    const { bucket, map } = fakeBinding();
+    const files = new Files({
+      adapter: r2({
+        binding: bucket as unknown as Parameters<typeof r2>[0] extends {
+          binding: infer B;
+        }
+          ? B
+          : never,
+      }),
+    });
+    expect(files.capabilities.conditional).toMatchObject({
+      create: true,
+      replace: true,
+    });
+    const created = await files.upload("a.txt", "one", {
+      condition: { type: "create" },
+    });
+    expect(created.etag).toBe("etag-1");
+    await expect(
+      files.upload("a.txt", "two", { condition: { type: "create" } })
+    ).rejects.toMatchObject({ code: "Conflict" });
+    const replaced = await files.upload("a.txt", "three", {
+      condition: { etag: created.etag, type: "replace" },
+    });
+    expect(replaced.etag).toBe("etag-2");
+    await expect(
+      files.upload("a.txt", "four", {
+        condition: { etag: created.etag, type: "replace" },
+      })
+    ).rejects.toMatchObject({ code: "Conflict" });
+    expect(new TextDecoder().decode(map.get("a.txt")?.bytes)).toBe("three");
+  });
 });
 
 describe("r2 resumable uploads (HTTP path delegates to the lazy s3 driver)", () => {
@@ -1947,14 +1995,6 @@ describe('r2 adapter — HTTP path with client: "fetch"', () => {
       });
     }).not.toThrow();
     await expect(pending).rejects.toThrow(/maxSize.*not supported/u);
-  });
-
-  test("multipart uploads throw instead of silently buffering", async () => {
-    const { adapter } = makeFetchAdapter();
-    const files = new Files({ adapter });
-    await expect(
-      files.upload("big.bin", "x", { multipart: true })
-    ).rejects.toThrow(/multipart uploads are not supported/u);
   });
 
   test("falls back to R2_* env credentials", async () => {

@@ -3,14 +3,17 @@ import type {
   R2Bucket,
   R2Object,
   R2ObjectBody,
+  R2PutOptions,
 } from "@cloudflare/workers-types";
 import type { AwsClient } from "aws4fetch";
 
 import type {
   Adapter,
   AdapterCapabilityDeclaration,
+  AdapterUploadOptions,
   Body,
   BulkError,
+  ConditionalUploadResult,
   DownloadOptions,
   FileInfo,
   SignUploadOptions,
@@ -434,6 +437,65 @@ const r2FromBinding = (opts: R2BindingOptions): R2Adapter => {
     return hybrid;
   };
 
+  /**
+   * One `put` through the binding. With `onlyIf`, R2 commits only while the
+   * condition holds and answers `null` otherwise, which is a `Conflict`.
+   */
+  const put = async (
+    key: string,
+    body: Body,
+    options: AdapterUploadOptions | undefined,
+    onlyIf?: R2PutOptions["onlyIf"]
+  ): Promise<UploadResult> => {
+    const { data, contentType, contentLength } = await normalizeForR2(
+      body,
+      options?.contentType
+    );
+    let result: Awaited<ReturnType<typeof bucket.put>>;
+    try {
+      // SAFETY: `data` is a string, an ArrayBuffer, or the platform
+      // `ReadableStream` — all accepted by `put`; only the stream's declared
+      // type (DOM vs workers-types) differs.
+      const value = data as Parameters<typeof bucket.put>[1];
+      result = await bucket.put(key, value, {
+        httpMetadata: {
+          contentType,
+          ...(options?.cacheControl && {
+            cacheControl: options.cacheControl,
+          }),
+        },
+        ...(options?.metadata && { customMetadata: options.metadata }),
+        ...(onlyIf && { onlyIf }),
+      });
+    } catch (error) {
+      throw mapR2Error(error);
+    }
+    if (onlyIf && !result) {
+      throw new FilesError(
+        "Conflict",
+        `r2 binding: the condition on "${key}" no longer holds`
+      );
+    }
+    return {
+      contentType,
+      etag: result?.etag,
+      key,
+      lastModified: result?.uploaded?.getTime(),
+      size: result?.size ?? contentLength ?? 0,
+    } satisfies UploadResult;
+  };
+
+  /** A conditional `put`, whose committed object always carries its ETag. */
+  const conditionalPut = async (
+    key: string,
+    body: Body,
+    options: AdapterUploadOptions | undefined,
+    onlyIf: R2PutOptions["onlyIf"]
+  ): Promise<ConditionalUploadResult> => {
+    const { etag, ...stored } = await put(key, body, options, onlyIf);
+    return { ...stored, etag: etag ?? "" };
+  };
+
   return {
     capabilities: {
       cacheControl: true,
@@ -458,6 +520,21 @@ const r2FromBinding = (opts: R2BindingOptions): R2Adapter => {
       // one-week ceiling; a bare `publicBaseUrl` is a permanent public link,
       // not a signed one.
       signedUrl: hybrid?.capabilities?.signedUrl ?? { supported: false },
+    },
+    conditional: {
+      // `If-None-Match: *` has no R2Conditional field; the binding takes the
+      // header form too.
+      create: (key, body, options) =>
+        conditionalPut(
+          key,
+          body,
+          options,
+          // SAFETY: the platform `Headers` the binding reads; only its
+          // declared type (DOM vs workers-types) differs.
+          new Headers({ "if-none-match": "*" }) as R2PutOptions["onlyIf"]
+        ),
+      replace: (key, body, etag, options) =>
+        conditionalPut(key, body, options, { etagMatches: etag }),
     },
     async copy(from, to) {
       // R2 bindings have no server-side copy, so this is a read-then-write.
@@ -613,36 +690,7 @@ const r2FromBinding = (opts: R2BindingOptions): R2Adapter => {
       assertNoSizeLimits(signOpts);
       return await signer.signedUploadUrl(key, signOpts);
     },
-    async upload(key, body, options) {
-      const { data, contentType, contentLength } = await normalizeForR2(
-        body,
-        options?.contentType
-      );
-      try {
-        // SAFETY: `data` is a string, an ArrayBuffer, or the platform
-        // `ReadableStream` — all accepted by `put`; only the stream's declared
-        // type (DOM vs workers-types) differs.
-        const value = data as Parameters<typeof bucket.put>[1];
-        const result = await bucket.put(key, value, {
-          httpMetadata: {
-            contentType,
-            ...(options?.cacheControl && {
-              cacheControl: options.cacheControl,
-            }),
-          },
-          ...(options?.metadata && { customMetadata: options.metadata }),
-        });
-        return {
-          contentType,
-          etag: result?.etag,
-          key,
-          lastModified: result?.uploaded?.getTime(),
-          size: result?.size ?? contentLength ?? 0,
-        } satisfies UploadResult;
-      } catch (error) {
-        throw mapR2Error(error);
-      }
-    },
+    upload: (key, body, options) => put(key, body, options),
     // `async` so misconfiguration rejects instead of throwing synchronously —
     // direct adapter callers attach `.catch` after; every other method here
     // already rejects.

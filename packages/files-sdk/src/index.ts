@@ -246,10 +246,10 @@ export interface UploadOptions extends OperationOptions {
    * `@aws-sdk/lib-storage` (an optional peer dependency) and is
    * **auto-engaged for unknown-length streams** even when this flag is unset.
    * OneDrive, GCS, Firebase, and Azure map it to their native chunking; other
-   * adapters already stream or chunk transparently and ignore it. The one
-   * exception is the S3 `fetch` client (`s3Fetch()`, and R2 / MinIO / RustFS
-   * with `client: "fetch"`), which has no multipart path and **throws** rather
-   * than silently buffering the body into a single PUT.
+   * adapters already stream or chunk transparently and ignore it. The S3
+   * `fetch` client (`s3Fetch()`, and R2 / MinIO / RustFS with
+   * `client: "fetch"`) runs its own multipart path, auto-engaged for a stream
+   * past one part.
    */
   multipart?: boolean | MultipartOptions;
   /**
@@ -290,6 +290,12 @@ export interface FileInfo {
    * (`head()` always does; `list()` only on adapters whose listing carries it).
    */
   metadata?: Record<string, string>;
+  /**
+   * The provider's id for this version of the object, on a bucket that keeps
+   * versions (S3's `x-amz-version-id`): what `upload()` created, or what
+   * `head()` / `download()` read. Absent where the provider reports none.
+   */
+  version?: string;
 }
 
 /** What `upload()` resolves to: the stored object's {@link FileInfo}. */

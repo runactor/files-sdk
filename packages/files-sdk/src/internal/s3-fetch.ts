@@ -4,12 +4,11 @@
 // weight defeats the point of web-standard tooling — see issue #76.
 //
 // Coverage vs the aws-sdk path: the full required `Adapter` surface plus
-// `signedUploadUrl`. Deliberately absent — each needs the S3 multipart/batch
-// XML surface or a policy signer this client doesn't carry:
-// - `resumableUpload` / `multipart` uploads (CreateMultipartUpload et al.):
-//   `upload()` buffers streams and issues a single PUT. (The multipart API
-//   appears only in `copy()`, for a source over CopyObject's 5 GiB ceiling,
-//   where it moves no bytes through this process.)
+// `signedUploadUrl`, multipart uploads, and the conditional create, replace,
+// and copy primitives. Deliberately absent — each needs the S3 batch XML
+// surface or a policy signer this client doesn't carry:
+// - `resumableUpload`: a stream body past one part goes up as a multipart
+//   upload, but the session can't be paused or resumed by another process.
 // - `deleteMany` (DeleteObjects needs a Content-MD5 the Web Crypto API can't
 //   produce): the SDK's bounded-concurrency `delete()` fan-out applies.
 // - presigned POST policies (`signedUploadUrl` with `maxSize` fails closed).
@@ -18,13 +17,20 @@ import { AwsClient } from "aws4fetch";
 
 import type {
   Adapter,
+  AdapterUploadOptions,
+  Body,
+  ConditionalUploadResult,
+  CopyCondition,
   DownloadOptions,
   FileInfo,
   ListOptions,
   ListResult,
+  MultipartOptions,
   OperationOptions,
   SignUploadOptions,
   SignedUpload,
+  UploadCondition,
+  UploadOptions,
   UrlOptions,
 } from "../index.js";
 import {
@@ -36,10 +42,11 @@ import {
   isAwsHost,
   isUnsatisfiableRange,
   mayBeCopySizeRefusal,
+  normalizeConditionalResponseEtag,
+  quoteCanonicalEtag,
 } from "../s3/shared.js";
 import {
   DEFAULT_URL_EXPIRES_IN,
-  collectStream,
   existsByProbe,
   httpRangeHeader,
   isMultipartRequested,
@@ -50,6 +57,7 @@ import {
 } from "./core.js";
 import { FilesError } from "./errors.js";
 import type { EventCapability } from "./events.js";
+import { isObject } from "./is.js";
 import { inferTypeFromName } from "./mime.js";
 import { createStoredFile } from "./stored-file.js";
 
@@ -69,6 +77,13 @@ export interface S3FetchAdapterOptions {
   endpoint: string;
   /** SigV4 signing region. Defaults to `us-east-1`; R2 uses `auto`. */
   region?: string;
+  /**
+   * Whether to expose the native conditional primitives: create
+   * (`If-None-Match: *`), replace (`If-Match`), and a copy pinned to the
+   * source's ETag. Defaults to `true` only for an AWS endpoint; an
+   * S3-compatible service is opted in once it is known to honor the headers.
+   */
+  conditional?: boolean;
   accessKeyId: string;
   secretAccessKey: string;
   sessionToken?: string;
@@ -93,9 +108,20 @@ export interface S3FetchAdapterOptions {
   fetch?: (request: Request) => Promise<Response>;
 }
 
-export type S3FetchAdapter = Adapter<AwsClient> & { readonly bucket: string };
+export type S3FetchAdapter = Adapter<AwsClient> & {
+  readonly bucket: string;
+  /** The endpoint origin requests go to (`endpoint`, any path dropped). */
+  readonly endpoint: string;
+  /** Whether requests address the bucket path-style. */
+  readonly forcePathStyle: boolean;
+};
 
 const DEFAULT_CONTENT_TYPE = "application/octet-stream";
+// S3's multipart floor: every part but the last is at least 5 MiB. (Past
+// 10,000 parts the provider refuses the part, which aborts the upload.)
+const MIN_PART_SIZE = 5 * 1024 * 1024;
+const DEFAULT_PART_CONCURRENCY = 4;
+const VERSION_HEADER = "x-amz-version-id";
 const METADATA_HEADER_PREFIX = "x-amz-meta-";
 // The object headers CopyObject carries to the copy, besides user metadata,
 // which a multipart copy has to set on CreateMultipartUpload itself.
@@ -158,6 +184,10 @@ const XML_NAMED_ENTITIES = new Map([
   ["&lt;", "<"],
   ["&quot;", '"'],
 ]);
+
+/** Escape text for an XML element body. */
+const escapeXmlText = (text: string): string =>
+  text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 /** Decode the XML character entities S3 escapes into list-response text. */
 const decodeXmlText = (text: string): string =>
@@ -259,6 +289,67 @@ const listQueryUrl = (baseUrl: string, listOpts?: ListOptions): string => {
   return url.toString();
 };
 
+/** The destination predicate of a conditional write, as request headers. */
+const destinationPredicate = (
+  condition: UploadCondition
+): Record<string, string> =>
+  condition.type === "create"
+    ? { "if-none-match": "*" }
+    : { "if-match": quoteCanonicalEtag(condition.etag) };
+
+/** A multipart upload's part size and how many parts go up at once. */
+const multipartPlan = (multipart: UploadOptions["multipart"]) => {
+  const tuned: MultipartOptions = isObject(multipart) ? multipart : {};
+  const partSize = tuned.partSize ?? MIN_PART_SIZE;
+  if (partSize < MIN_PART_SIZE) {
+    throw new FilesError(
+      "Invalid",
+      `multipart.partSize must be at least ${MIN_PART_SIZE} bytes (5 MiB), the S3 minimum for every part but the last`
+    );
+  }
+  return {
+    concurrency: tuned.concurrency ?? DEFAULT_PART_CONCURRENCY,
+    partSize,
+  };
+};
+
+/**
+ * Cut a stream into `size`-byte parts (the last may be shorter), holding one
+ * part at a time. Equal parts matter: R2 refuses a multipart upload whose
+ * non-final parts differ in size.
+ */
+const partReader = (stream: ReadableStream<Uint8Array>, size: number) => {
+  const reader = stream.getReader();
+  let carry: Uint8Array = new Uint8Array();
+  let ended = false;
+  return {
+    async cancel(): Promise<void> {
+      try {
+        await reader.cancel();
+      } catch {
+        // The upload's own failure is the one to report.
+      }
+    },
+    async next(): Promise<Uint8Array | undefined> {
+      const part = new Uint8Array(size);
+      let filled = Math.min(carry.byteLength, size);
+      part.set(carry.subarray(0, filled));
+      carry = carry.subarray(filled);
+      while (filled < size && !ended) {
+        // oxlint-disable-next-line no-await-in-loop, react-doctor/async-await-in-loop -- one stream reader; chunks arrive in order
+        const chunk = await reader.read();
+        ended = chunk.done;
+        const value = chunk.value ?? new Uint8Array();
+        const taken = Math.min(value.byteLength, size - filled);
+        part.set(value.subarray(0, taken), filled);
+        filled += taken;
+        carry = value.subarray(taken);
+      }
+      return filled === 0 ? undefined : part.subarray(0, filled);
+    },
+  };
+};
+
 // oxlint-disable-next-line sonarjs/cognitive-complexity -- a linear sequence of small per-op closures over one shared signer; splitting them apart would separate each op from the config it closes over
 export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
   const { bucket } = opts;
@@ -281,7 +372,8 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
   });
 
   const endpointUrl = new URL(opts.endpoint);
-  const baseUrl = opts.forcePathStyle
+  const forcePathStyle = opts.forcePathStyle === true;
+  const baseUrl = forcePathStyle
     ? `${endpointUrl.origin}/${encodeURIComponent(bucket)}`
     : `${endpointUrl.protocol}//${bucket}.${endpointUrl.host}`;
 
@@ -420,6 +512,7 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
     }
     const etag = stripEtag(headers.get("etag") ?? undefined);
     const lastModified = parseTimestamp(headers.get("last-modified"));
+    const version = headers.get(VERSION_HEADER);
     return {
       contentType: headers.get("content-type") ?? DEFAULT_CONTENT_TYPE,
       key,
@@ -427,6 +520,7 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
       ...(etag && { etag }),
       ...(lastModified !== undefined && { lastModified }),
       ...(metadata && { metadata }),
+      ...(version && { version }),
     };
   };
 
@@ -602,10 +696,365 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
     }
   };
 
+  /** A write's ETag and, on a versioned bucket, the version it created. */
+  const written = (headers: Headers, xmlEtag?: string) => {
+    const etag = xmlEtag ?? headers.get("etag") ?? undefined;
+    const version = headers.get(VERSION_HEADER);
+    return { etag, ...(version && { version }) };
+  };
+
+  // A provider without conditional writes (Backblaze B2 among them) answers
+  // the header with 501 NotImplemented: the endpoint can't do this, which is
+  // a refusal, not a failure to retry.
+  const assertImplemented = async (
+    res: Response,
+    predicate: Record<string, string> | undefined
+  ): Promise<void> => {
+    if (predicate === undefined || res.status !== 501) {
+      return;
+    }
+    throw new FilesError(
+      "Unsupported",
+      `${providerLabel}: this endpoint does not implement conditional writes`,
+      errorFromXml(await drainText(res), res.status)
+    );
+  };
+
+  const putObject = async (
+    key: string,
+    bytes: Uint8Array,
+    headers: Record<string, string>,
+    predicate: Record<string, string> | undefined,
+    signal: AbortSignal | undefined
+  ) => {
+    const res = await send("PUT", objectUrl(key), {
+      body: bytes,
+      headers: { ...headers, ...predicate },
+      ...(signal && { signal }),
+    });
+    await assertImplemented(res, predicate);
+    if (!res.ok) {
+      throw await errorFromResponse(res);
+    }
+    await drainText(res);
+    return written(res.headers);
+  };
+
+  /**
+   * Upload parts as `nextPart` yields them, at most `concurrency` in flight,
+   * then complete the upload with the predicate (S3 and R2 evaluate
+   * `If-None-Match` / `If-Match` on CompleteMultipartUpload, atomically with
+   * the commit). Any failure aborts the upload, after the parts in flight
+   * settle, so no part outlives it.
+   */
+  const multipartUpload = async (
+    key: string,
+    nextPart: () => Promise<Uint8Array | undefined>,
+    headers: Record<string, string>,
+    predicate: Record<string, string> | undefined,
+    concurrency: number,
+    signal: AbortSignal | undefined
+  ) => {
+    const signalInit = signal ? { signal } : {};
+    const created = await readWriteResult(
+      await send("POST", `${objectUrl(key)}?uploads`, {
+        headers,
+        ...signalInit,
+      })
+    );
+    const rawUploadId = XML_UPLOAD_ID_RE.exec(created)?.groups?.value;
+    if (!rawUploadId) {
+      throw new FilesError(
+        "Provider",
+        `${providerLabel}: CreateMultipartUpload returned no UploadId`
+      );
+    }
+    const uploadQuery = `uploadId=${encodeURIComponent(decodeXmlText(rawUploadId))}`;
+    const uploadPart = async (partNumber: number, bytes: Uint8Array) => {
+      const res = await send(
+        "PUT",
+        `${objectUrl(key)}?partNumber=${partNumber}&${uploadQuery}`,
+        { body: bytes, ...signalInit }
+      );
+      if (!res.ok) {
+        throw await errorFromResponse(res);
+      }
+      await drainText(res);
+      const etag = res.headers.get("etag");
+      if (!etag) {
+        throw new FilesError(
+          "Provider",
+          `${providerLabel}: UploadPart returned no ETag for part ${partNumber}`
+        );
+      }
+      return etag;
+    };
+    // `concurrency` workers share one source of parts. A read waits for the
+    // read before it (a stream is cut in order), and a failure stops every
+    // worker from taking another part, so the abort below finds none in flight.
+    const etags: string[] = [];
+    let turn: Promise<null> = Promise.resolve(null);
+    let stopped = false;
+    const take = async () => {
+      const previous = turn;
+      const { promise, resolve } = Promise.withResolvers<null>();
+      turn = promise;
+      try {
+        await previous;
+        if (stopped) {
+          return;
+        }
+        const bytes = await nextPart();
+        return bytes && { bytes, partNumber: etags.push("") };
+      } finally {
+        resolve(null);
+      }
+    };
+    const worker = async (): Promise<void> => {
+      try {
+        for (
+          let part = await take();
+          part;
+          // oxlint-disable-next-line no-await-in-loop, react-doctor/async-await-in-loop -- one part at a time per worker bounds the memory held
+          part = await take()
+        ) {
+          // oxlint-disable-next-line no-await-in-loop, react-doctor/async-await-in-loop -- as above
+          etags[part.partNumber - 1] = await uploadPart(
+            part.partNumber,
+            part.bytes
+          );
+        }
+      } catch (error) {
+        stopped = true;
+        throw error;
+      }
+    };
+    try {
+      const settled = await Promise.allSettled(
+        Array.from({ length: concurrency }, worker)
+      );
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) {
+        throw failed.reason;
+      }
+      const parts = etags
+        .map(
+          (etag, index) =>
+            `<Part><PartNumber>${index + 1}</PartNumber><ETag>${escapeXmlText(etag)}</ETag></Part>`
+        )
+        .join("");
+      const res = await send("POST", `${objectUrl(key)}?${uploadQuery}`, {
+        body: new TextEncoder().encode(
+          `<CompleteMultipartUpload>${parts}</CompleteMultipartUpload>`
+        ),
+        headers: { "content-type": "application/xml", ...predicate },
+        ...signalInit,
+      });
+      await assertImplemented(res, predicate);
+      const xml = await readWriteResult(res);
+      const rawEtag = XML_ETAG_RE.exec(xml)?.groups?.value;
+      return written(res.headers, rawEtag && decodeXmlText(rawEtag));
+    } catch (error) {
+      try {
+        await drainText(
+          await send("DELETE", `${objectUrl(key)}?${uploadQuery}`)
+        );
+      } catch {
+        // Best-effort: the upload's own failure is the one to report, and an
+        // unaborted upload is reclaimed by the bucket's lifecycle rules.
+      }
+      throw error;
+    }
+  };
+
+  /**
+   * Write `body` at `key`: one PUT for a buffered body or a stream that ends
+   * within one part, else a multipart upload that holds at most `partSize *
+   * (concurrency + 1)` bytes. `multipart` forces the multipart path for a
+   * buffered body larger than one part.
+   */
+  const write = async (
+    key: string,
+    body: Body,
+    uploadOpts: UploadOptions | undefined,
+    predicate?: Record<string, string>
+  ): Promise<FileInfo & ReturnType<typeof written>> => {
+    assertHeaderSafeUploadOptions(providerLabel, uploadOpts);
+    const { concurrency, partSize } = multipartPlan(uploadOpts?.multipart);
+    const { data, contentType } = await normalizeBody(
+      body,
+      uploadOpts?.contentType
+    );
+    const headers = {
+      "content-type": contentType,
+      ...(uploadOpts?.cacheControl && {
+        "cache-control": uploadOpts.cacheControl,
+      }),
+      ...Object.fromEntries(
+        Object.entries(uploadOpts?.metadata ?? {}).map(([name, value]) => [
+          `${METADATA_HEADER_PREFIX}${name}`,
+          value,
+        ])
+      ),
+    };
+    const signal = uploadOpts?.signal;
+    const result = (size: number, receipt: ReturnType<typeof written>) => ({
+      contentType,
+      key,
+      size,
+      ...receipt,
+    });
+    if (!(data instanceof ReadableStream)) {
+      if (
+        !isMultipartRequested(uploadOpts?.multipart) ||
+        data.byteLength <= partSize
+      ) {
+        return result(
+          data.byteLength,
+          await putObject(key, data, headers, predicate, signal)
+        );
+      }
+      let offset = 0;
+      const nextSlice = () => {
+        const slice =
+          offset < data.byteLength
+            ? data.subarray(offset, offset + partSize)
+            : undefined;
+        offset += partSize;
+        return Promise.resolve(slice);
+      };
+      return result(
+        data.byteLength,
+        await multipartUpload(
+          key,
+          nextSlice,
+          headers,
+          predicate,
+          concurrency,
+          signal
+        )
+      );
+    }
+    const parts = partReader(data, partSize);
+    try {
+      const first = (await parts.next()) ?? new Uint8Array();
+      const second =
+        first.byteLength < partSize ? undefined : await parts.next();
+      if (second === undefined) {
+        return result(
+          first.byteLength,
+          await putObject(key, first, headers, predicate, signal)
+        );
+      }
+      let size = 0;
+      const queued = [first, second];
+      const nextPart = async () => {
+        const part = queued.shift() ?? (await parts.next());
+        size += part?.byteLength ?? 0;
+        return part;
+      };
+      const receipt = await multipartUpload(
+        key,
+        nextPart,
+        headers,
+        predicate,
+        concurrency,
+        signal
+      );
+      return result(size, receipt);
+    } catch (error) {
+      await parts.cancel();
+      throw error;
+    }
+  };
+
+  const conditionalWrite = async (
+    key: string,
+    body: Body,
+    condition: UploadCondition,
+    uploadOpts: AdapterUploadOptions | undefined
+  ): Promise<ConditionalUploadResult> => {
+    const stored = await write(
+      key,
+      body,
+      uploadOpts,
+      destinationPredicate(condition)
+    );
+    return {
+      ...stored,
+      etag: normalizeConditionalResponseEtag(
+        stored.etag,
+        "a conditional upload",
+        true
+      ),
+    };
+  };
+
+  const conditional: S3FetchAdapter["conditional"] =
+    (opts.conditional ?? awsHost)
+      ? {
+          copy: {
+            atomicSourceDestination: true,
+            destinationCreate: true,
+            destinationReplace: true,
+            async run(
+              from: string,
+              to: string,
+              condition: CopyCondition,
+              operationOpts
+            ): Promise<void> {
+              const predicate = destinationPredicate(condition.destination);
+              const res = await send("PUT", objectUrl(to), {
+                headers: {
+                  "x-amz-copy-source": copySource(from),
+                  "x-amz-copy-source-if-match": quoteCanonicalEtag(
+                    condition.source.etag
+                  ),
+                  ...predicate,
+                },
+                ...(operationOpts?.signal && { signal: operationOpts.signal }),
+              });
+              await assertImplemented(res, predicate);
+              if (res.ok) {
+                await readWriteResult(res);
+                return;
+              }
+              const xml = await drainText(res);
+              const rawCode = XML_CODE_RE.exec(xml)?.groups?.value;
+              const failure = errorFromXml(xml, res.status);
+              // The destination predicate rides one CopyObject request, so a
+              // source past its 5 GiB ceiling is refused, not split up.
+              if (
+                await oversizedCopySource(
+                  from,
+                  {
+                    code: rawCode && decodeXmlText(rawCode),
+                    status: res.status,
+                  },
+                  operationOpts
+                )
+              ) {
+                throw new FilesError(
+                  "Unsupported",
+                  `${providerLabel}: a conditional copy is one CopyObject request, which S3 limits to 5 GiB sources; "${from}" is larger`,
+                  failure
+                );
+              }
+              throw failure;
+            },
+            sourceEtag: true,
+          },
+          create: (key, body, uploadOpts) =>
+            conditionalWrite(key, body, { type: "create" }, uploadOpts),
+          replace: (key, body, etag, uploadOpts) =>
+            conditionalWrite(key, body, { etag, type: "replace" }, uploadOpts),
+        }
+      : undefined;
+
   return {
     bucket,
-    // No `uploadProgress`: bodies go up as one buffered PUT with no native
-    // progress hook, so the Files wrapper reports progress generically.
+    // No `uploadProgress`: there is no native progress hook, so the Files
+    // wrapper reports progress generically (byte-by-byte for a stream body).
     capabilities: {
       cacheControl: true,
       delimiter: "any",
@@ -639,6 +1088,7 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
         supported: true,
       },
     },
+    conditional,
     async copy(from, to, operationOpts) {
       const res = await send("PUT", objectUrl(to), {
         headers: { "x-amz-copy-source": copySource(from) },
@@ -705,9 +1155,11 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
         { data: bytes, kind: "buffer" }
       );
     },
+    endpoint: endpointUrl.origin,
     exists(key, operationOpts) {
       return existsByProbe(() => headResponse(key, operationOpts), mapError);
     },
+    forcePathStyle,
     async head(key, operationOpts) {
       const res = await headResponse(key, operationOpts);
       return responseMeta(key, res.headers);
@@ -783,53 +1235,9 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
       } satisfies SignedUpload;
     },
     async upload(key, body, uploadOpts) {
-      if (isMultipartRequested(uploadOpts?.multipart)) {
-        // `Unsupported`: fail loudly instead of silently buffering what the
-        // caller asked to chunk — a single PUT caps at 5 GB and buffering a
-        // body that size is exactly what multipart exists to avoid.
-        throw new FilesError(
-          "Unsupported",
-          `${providerLabel}: multipart uploads are not supported by the fetch client (bodies go up as a single PUT). Use the aws-sdk client on a runtime where it runs (it needs a DOMParser, which Cloudflare Workers lack), or upload in a single request under the 5 GB PUT cap.`
-        );
-      }
-      assertHeaderSafeUploadOptions(providerLabel, uploadOpts);
-      const { data, contentType } = await normalizeBody(
-        body,
-        uploadOpts?.contentType
-      );
-      // Streams are buffered: a single SigV4 PUT needs a Content-Length up
-      // front, and the multipart API this would otherwise chunk through is
-      // aws-sdk-client territory.
-      const bytes =
-        data instanceof ReadableStream ? await collectStream(data) : data;
-      const metadataHeaders = Object.fromEntries(
-        Object.entries(uploadOpts?.metadata ?? {}).map(([name, value]) => [
-          `${METADATA_HEADER_PREFIX}${name}`,
-          value,
-        ])
-      );
-      const res = await send("PUT", objectUrl(key), {
-        body: bytes,
-        headers: {
-          "content-type": contentType,
-          ...(uploadOpts?.cacheControl && {
-            "cache-control": uploadOpts.cacheControl,
-          }),
-          ...metadataHeaders,
-        },
-        ...(uploadOpts?.signal && { signal: uploadOpts.signal }),
-      });
-      if (!res.ok) {
-        throw await errorFromResponse(res);
-      }
-      await drainText(res);
-      const etag = stripEtag(res.headers.get("etag") ?? undefined);
-      return {
-        contentType,
-        key,
-        size: bytes.byteLength,
-        ...(etag && { etag }),
-      };
+      const { etag, ...stored } = await write(key, body, uploadOpts);
+      const bare = stripEtag(etag);
+      return { ...stored, ...(bare && { etag: bare }) };
     },
     url(key, urlOpts?: UrlOptions): Promise<string> {
       const strategy = resolveUrlStrategy({

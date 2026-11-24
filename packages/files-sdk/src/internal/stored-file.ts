@@ -291,6 +291,7 @@ export const createStoredFile = (
     metadata: meta.metadata,
     name: meta.key,
     size: meta.size,
+    ...(meta.version !== undefined && { version: meta.version }),
     stream() {
       if (cached) {
         return streamFromBytes(cached);

@@ -76,8 +76,8 @@ const files = new Files({
 
 The fetch client covers `upload`, `download` (including [ranges](/docs/api/download#byte-ranges)), `head`, `exists`, `delete`, `list` (including `delimiter` folding), server-side `copy`, presigned `url()`, and `signedUploadUrl()`. Trade-offs against the `"aws-sdk"` client:
 
-- `ReadableStream` bodies are buffered in memory before a single PUT (a lone PUT needs a `Content-Length`, and single-request uploads cap at 5&nbsp;GB on R2).
-- `multipart` and resumable (`control`) uploads throw instead of engaging the S3 multipart API.
+- A `ReadableStream` body that ends within one part (5&nbsp;MiB, or `multipart.partSize`) goes up as a single PUT; a longer one goes up as a multipart upload in equal parts, holding at most `partSize × (concurrency + 1)` bytes. `multipart` splits a buffered body the same way. A failed upload is aborted.
+- Resumable (`control`) uploads throw.
 - Bulk deletes fan out as per-key `delete()` calls instead of batched `DeleteObjects` requests. On Workers each call is a subrequest, so chunk large bulk deletes to stay under the per-invocation subrequest cap.
 - Keys containing `.` or `..` path segments are rejected - URL normalization would silently sign a request for a different key.
 - Byte-level `onProgress` reporting falls back to the SDK's generic reporting.
@@ -152,7 +152,7 @@ To cap upload sizes on R2, enforce the limit at your application gateway before 
 
 ## Conditional operations
 
-R2 does not advertise the SDK's provider-native [conditional operation](/docs/conditional-operations) contract in this release. That includes the AWS-SDK HTTP path: configuring an S3-compatible endpoint does not inherit AWS S3's capability claims. Conditional calls fail before R2 I/O.
+Under the Workers `R2Bucket` binding, conditional creates and replaces go through the binding's `onlyIf` (`If-None-Match: *` and `etagMatches`); a condition that no longer holds rejects with `Conflict`. Exact reads, conditional deletes, and conditional copies are not advertised there. The HTTP paths do not advertise the contract: configuring an S3-compatible endpoint does not inherit AWS S3's capability claims, and conditional calls fail before R2 I/O.
 
 ## Compatibility
 
@@ -175,7 +175,7 @@ R2 does not advertise the SDK's provider-native [conditional operation](/docs/co
 
 | Method | Status | Notes |
 | --- | :-: | --- |
-| `upload` | ⚠️ | Single PUT - `ReadableStream` bodies are buffered in memory first, and `multipart` / resumable `control` uploads throw. Multipart needs the `"aws-sdk"` client, which runs on Workers only with a `DOMParser` polyfill. |
+| `upload` | ⚠️ | A stream past one part, or `multipart`, goes up as a multipart upload; resumable `control` uploads throw. |
 | `download` | ✅ |  |
 | `delete` | ✅ | Bulk deletes fan out per key (no batched `DeleteObjects`). |
 | `list` | ⚠️ | The S3 list API returns no per-object `Content-Type`, so `contentType` is inferred from the key's extension (`application/octet-stream` when unknown). Use `head()` for the stored value. |

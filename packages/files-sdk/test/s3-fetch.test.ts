@@ -144,16 +144,6 @@ describe("s3-fetch core — upload", () => {
     expect(await roundTrip.text()).toBe("from-a-stream");
   });
 
-  test("multipart uploads fail loudly with a permanent error", async () => {
-    const { adapter } = withFake();
-    const error = await expectCode(
-      adapter.upload("big.bin", "x", { multipart: true }),
-      "Unsupported"
-    );
-    expect(error.message).toMatch(/multipart uploads are not supported/u);
-    expect(error.permanent).toBe(true);
-  });
-
   test("upload surfaces provider errors mapped by status", async () => {
     const { adapter, fake } = withFake();
     fake.denyAll = true;
@@ -1256,5 +1246,392 @@ describe("s3-fetch core — copies over CopyObject's 5 GiB ceiling", () => {
     for (const { requests } of [small, unreadable, lengthless, missing]) {
       expect(steps(requests, "POST", "uploads")).toHaveLength(0);
     }
+  });
+});
+
+const MIB = 1024 * 1024;
+
+/** `size` bytes of a repeating pattern, so a misplaced part shows. */
+const patterned = (size: number, seed = 0): Uint8Array =>
+  Uint8Array.from({ length: size }, (_, index) => (index + seed) % 251);
+
+const streamOf = (...chunks: Uint8Array[]): ReadableStream<Uint8Array> =>
+  new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+      controller.close();
+    },
+  });
+
+const joined = (...chunks: Uint8Array[]): Uint8Array => {
+  const out = new Uint8Array(
+    chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+  );
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+};
+
+/** The fake, with `intercept` answering the requests it chooses to. */
+const withIntercept = (
+  intercept: (
+    request: Request,
+    url: URL
+  ) => Response | Promise<Response> | undefined,
+  overrides: Partial<S3FetchAdapterOptions> = {}
+) => {
+  const fake = makeFakeS3();
+  const adapter = makeAdapter({
+    fetch: async (request) => {
+      const answer = await intercept(request, new URL(request.url));
+      return answer ?? fake.fetchImpl(request);
+    },
+    ...overrides,
+  });
+  return { adapter, fake };
+};
+
+describe("s3-fetch core — multipart uploads", () => {
+  test("a stream past one part goes up in equal parts and round-trips", async () => {
+    const sent = new Map<string | null, Promise<ArrayBuffer>>();
+    const { adapter, fake } = withIntercept((request, url) => {
+      if (url.searchParams.has("partNumber")) {
+        sent.set(
+          url.searchParams.get("partNumber"),
+          request.clone().arrayBuffer()
+        );
+      }
+    });
+    const first = patterned(7 * MIB);
+    const second = patterned(4 * MIB, 7);
+    const result = await new Files({ adapter }).upload(
+      "big.bin",
+      streamOf(first, second),
+      { metadata: { owner: "ana" } }
+    );
+    expect(result.size).toBe(11 * MIB);
+    expect(result.etag).toBe("etag-1");
+    const sizes = await Promise.all(
+      ["1", "2", "3"].map(async (part) => {
+        const bytes = await sent.get(part);
+        return bytes?.byteLength;
+      })
+    );
+    expect(sizes).toEqual([5 * MIB, 5 * MIB, MIB]);
+    const stored = fake.store.get("big.bin");
+    expect(stored?.bytes).toEqual(joined(first, second));
+    expect(stored?.meta).toEqual({ owner: "ana" });
+    expect(fake.uploads.size).toBe(0);
+  });
+
+  test("multipart slices a buffered body with at most `concurrency` parts in flight", async () => {
+    let inFlight = 0;
+    let most = 0;
+    const { adapter, fake } = withIntercept((request, url) => {
+      if (!url.searchParams.has("partNumber")) {
+        return;
+      }
+      inFlight += 1;
+      most = Math.max(most, inFlight);
+      return (async () => {
+        await Bun.sleep(5);
+        inFlight -= 1;
+        return fake.fetchImpl(request);
+      })();
+    });
+    const body = patterned(16 * MIB);
+    await adapter.upload("sliced.bin", body, {
+      multipart: { concurrency: 2, partSize: 5 * MIB },
+    });
+    expect(fake.store.get("sliced.bin")?.bytes).toEqual(body);
+    expect(most).toBe(2);
+    // A body within one part stays a single PUT even when multipart is asked.
+    await adapter.upload("small.bin", "small", { multipart: true });
+    expect(fake.requests.at(-1)?.url).toEndWith("/uploads/small.bin");
+  });
+
+  test("a partSize under the 5 MiB floor is refused before any request", async () => {
+    const { adapter, fake } = withFake();
+    await expectCode(
+      adapter.upload("x.bin", "x", { multipart: { partSize: MIB } }),
+      "Invalid"
+    );
+    expect(fake.requests).toHaveLength(0);
+  });
+
+  test("a failed part aborts the upload, which leaves none behind", async () => {
+    const { adapter, fake } = withIntercept((_request, url) =>
+      url.searchParams.get("partNumber") === "2"
+        ? new Response(
+            "<Error><Code>InternalError</Code><Message>part failed</Message></Error>",
+            { status: 500 }
+          )
+        : undefined
+    );
+    const error = await expectCode(
+      adapter.upload("x.bin", patterned(11 * MIB), { multipart: true }),
+      "Provider"
+    );
+    expect(error.message).toBe("part failed");
+    expect(fake.uploads.size).toBe(0);
+    expect(fake.store.has("x.bin")).toBe(false);
+  });
+
+  test("a stream that breaks mid-upload fails it; a failing abort doesn't mask that", async () => {
+    let aborted = false;
+    const { adapter, fake } = withIntercept((request) => {
+      if (request.method !== "DELETE") {
+        return;
+      }
+      aborted = true;
+      return Promise.reject(new TypeError("abort failed"));
+    });
+    let pulls = 0;
+    const breaking = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 2) {
+          controller.error(new Error("source broke"));
+          return;
+        }
+        controller.enqueue(patterned(5 * MIB));
+      },
+    });
+    await expect(adapter.upload("x.bin", breaking)).rejects.toThrow(
+      "source broke"
+    );
+    expect(aborted).toBe(true);
+    expect(fake.store.has("x.bin")).toBe(false);
+  });
+
+  test("an upload without an UploadId, or a part without an ETag, is a Provider failure", async () => {
+    const noUpload = withIntercept((_request, url) =>
+      url.searchParams.has("uploads")
+        ? new Response("<InitiateMultipartUploadResult/>")
+        : undefined
+    );
+    const missingId = await expectCode(
+      noUpload.adapter.upload("x.bin", patterned(6 * MIB), { multipart: true }),
+      "Provider"
+    );
+    expect(missingId.message).toMatch(/returned no UploadId/u);
+
+    const noEtag = withIntercept((_request, url) =>
+      url.searchParams.has("partNumber") ? new Response(null) : undefined
+    );
+    const missingEtag = await expectCode(
+      noEtag.adapter.upload("x.bin", patterned(6 * MIB), { multipart: true }),
+      "Provider"
+    );
+    expect(missingEtag.message).toMatch(
+      /UploadPart returned no ETag for part/u
+    );
+    expect(noEtag.fake.uploads.size).toBe(0);
+  });
+});
+
+describe("s3-fetch core — conditional writes", () => {
+  test("off for an S3-compatible endpoint unless opted in; on for AWS", () => {
+    expect(makeAdapter().conditional).toBeUndefined();
+    expect(
+      makeAdapter({ endpoint: "https://s3.us-east-1.amazonaws.com" })
+        .conditional
+    ).toBeDefined();
+    const adapter = makeAdapter({ conditional: true });
+    expect(new Files({ adapter }).capabilities.conditional).toMatchObject({
+      copy: { destinationCreate: true, destinationReplace: true },
+      create: true,
+      replace: true,
+    });
+    expect(adapter.endpoint).toBe("https://acct.r2.cloudflarestorage.com");
+    expect(adapter.forcePathStyle).toBe(true);
+    expect(makeAdapter({ forcePathStyle: undefined }).forcePathStyle).toBe(
+      false
+    );
+  });
+
+  test("create sends If-None-Match: * and refuses a taken key as Conflict", async () => {
+    const { adapter, fake } = withFake({ conditional: true });
+    const files = new Files({ adapter });
+    const created = await files.upload("a.txt", "one", {
+      condition: { type: "create" },
+    });
+    expect(created.etag).toBe("etag-1");
+    expect(fake.requests.at(-1)?.headers.get("if-none-match")).toBe("*");
+    await expectCode(
+      files.upload("a.txt", "two", { condition: { type: "create" } }),
+      "Conflict"
+    );
+    const kept = await files.download("a.txt");
+    expect(await kept.text()).toBe("one");
+  });
+
+  test("replace sends If-Match and refuses a stale ETag as Conflict", async () => {
+    const { adapter, fake } = withFake({ conditional: true });
+    const files = new Files({ adapter });
+    const { etag } = await files.upload("a.txt", "one");
+    const replaced = await files.upload("a.txt", "two", {
+      condition: { etag: etag ?? "", type: "replace" },
+    });
+    expect(fake.requests.at(-1)?.headers.get("if-match")).toBe(`"${etag}"`);
+    await expectCode(
+      files.upload("a.txt", "three", {
+        condition: { etag: etag ?? "", type: "replace" },
+      }),
+      "Conflict"
+    );
+    expect(replaced.etag).toBe("etag-2");
+  });
+
+  test("a stream past one part carries the predicate on CompleteMultipartUpload", async () => {
+    const { adapter, fake } = withFake({ conditional: true });
+    const files = new Files({ adapter });
+    const body = patterned(6 * MIB);
+    const created = await files.upload("big.bin", streamOf(body), {
+      condition: { type: "create" },
+    });
+    expect(created).toMatchObject({ etag: "etag-1", size: 6 * MIB });
+    const complete = fake.requests.find(
+      (request) =>
+        request.method === "POST" &&
+        new URL(request.url).searchParams.has("uploadId")
+    );
+    expect(complete?.headers.get("if-none-match")).toBe("*");
+    expect(fake.store.get("big.bin")?.bytes).toEqual(body);
+
+    // The key is taken now: the parts go up, the completion is refused, and
+    // the upload is aborted.
+    await expectCode(
+      files.upload("big.bin", streamOf(patterned(6 * MIB, 3)), {
+        condition: { type: "create" },
+      }),
+      "Conflict"
+    );
+    expect(fake.uploads.size).toBe(0);
+    expect(fake.store.get("big.bin")?.bytes).toEqual(body);
+  });
+
+  test("an endpoint without conditional writes (501) is Unsupported: PUT, completion, copy", async () => {
+    const { adapter, fake } = withFake({ conditional: true });
+    fake.conditionalNotImplemented = true;
+    const files = new Files({ adapter });
+    const put = await expectCode(
+      files.upload("a.txt", "one", { condition: { type: "create" } }),
+      "Unsupported"
+    );
+    expect(put.message).toMatch(/does not implement conditional writes/u);
+    await expectCode(
+      files.upload("big.bin", streamOf(patterned(6 * MIB)), {
+        condition: { type: "create" },
+      }),
+      "Unsupported"
+    );
+    expect(fake.uploads.size).toBe(0);
+    fake.seed("src.txt", "source");
+    await expectCode(
+      files.copy("src.txt", "dst.txt", {
+        condition: {
+          destination: { type: "create" },
+          source: { etag: fake.store.get("src.txt")?.etag ?? "" },
+        },
+      }),
+      "Unsupported"
+    );
+  });
+
+  test("copy pins the source ETag and honors the destination predicate", async () => {
+    const { adapter, fake } = withFake({ conditional: true });
+    const files = new Files({ adapter });
+    const source = await files.upload("src.txt", "source");
+    const sourceEtag = source.etag ?? "";
+    await files.copy("src.txt", "dst.txt", {
+      condition: {
+        destination: { type: "create" },
+        source: { etag: sourceEtag },
+      },
+    });
+    const copy = fake.requests.at(-1);
+    expect(copy?.headers.get("x-amz-copy-source-if-match")).toBe(
+      `"${sourceEtag}"`
+    );
+    expect(copy?.headers.get("if-none-match")).toBe("*");
+    const copied = await files.download("dst.txt");
+    expect(await copied.text()).toBe("source");
+    await expectCode(
+      files.copy("src.txt", "dst.txt", {
+        condition: {
+          destination: { type: "create" },
+          source: { etag: sourceEtag },
+        },
+      }),
+      "Conflict"
+    );
+    await expectCode(
+      files.copy("src.txt", "other.txt", {
+        condition: {
+          destination: { type: "create" },
+          source: { etag: "stale" },
+        },
+      }),
+      "Conflict"
+    );
+    const destination = await files.head("dst.txt");
+    await files.copy("src.txt", "dst.txt", {
+      condition: {
+        destination: { etag: destination.etag ?? "", type: "replace" },
+        source: { etag: sourceEtag },
+      },
+    });
+    expect(fake.requests.at(-1)?.headers.get("if-match")).toBe(
+      `"${destination.etag}"`
+    );
+  });
+
+  test("a conditional copy of a source past 5 GiB is Unsupported, not split", async () => {
+    const { adapter } = withIntercept(
+      (request) => {
+        if (request.method === "HEAD") {
+          return new Response(null, {
+            headers: { "content-length": String(6 * 1024 * MIB) },
+          });
+        }
+        return request.headers.has("x-amz-copy-source")
+          ? new Response(
+              "<Error><Code>InvalidRequest</Code><Message>The specified copy source is larger than the maximum allowable size for a copy source: 5368709120</Message></Error>",
+              { status: 400 }
+            )
+          : undefined;
+      },
+      { conditional: true }
+    );
+    const error = await expectCode(
+      new Files({ adapter }).copy("huge.bin", "copy.bin", {
+        condition: { destination: { type: "create" }, source: { etag: "e" } },
+      }),
+      "Unsupported"
+    );
+    expect(error.message).toMatch(/limits to 5 GiB sources/u);
+  });
+
+  test("a version id rides upload, head, and download on a versioned bucket", async () => {
+    const { adapter, fake } = withFake({ conditional: true });
+    fake.versioned = true;
+    const files = new Files({ adapter });
+    const plain = await files.upload("a.txt", "one");
+    const multipart = await files.upload(
+      "big.bin",
+      streamOf(patterned(6 * MIB)),
+      { condition: { type: "create" } }
+    );
+    const head = await files.head("a.txt");
+    const download = await files.download("big.bin");
+    expect(
+      [plain, multipart, head, download].map((file) => file.version)
+    ).toEqual(["v-1", "v-2", "v-1", "v-2"]);
   });
 });

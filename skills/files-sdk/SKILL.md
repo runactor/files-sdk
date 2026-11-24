@@ -140,7 +140,7 @@ Result shapes: every array form but `exists` returns `{ results, errors? }` (`up
 
 Three per-call `upload`/`download` options for big objects — all detailed in [references/large-uploads.md](references/large-uploads.md):
 
-- **`multipart`** on `upload` — split a large body into parallel parts (`true`, or `{ partSize, concurrency }`, both positive integers or the upload throws `Invalid`). The robust path past the single-request limit and for `ReadableStream` bodies of unknown length (which **auto-engage** multipart on S3-family adapters even without the flag). Maps to each provider's native chunking; unsupported adapters that only take buffered bodies ignore it, except the `fetch` S3 engine, which throws.
+- **`multipart`** on `upload` — split a large body into parallel parts (`true`, or `{ partSize, concurrency }`, both positive integers or the upload throws `Invalid`). The robust path past the single-request limit and for `ReadableStream` bodies of unknown length (which **auto-engage** multipart on S3-family adapters even without the flag). Maps to each provider's native chunking; unsupported adapters that only take buffered bodies ignore it. The `fetch` S3 engine runs its own multipart path (no `lib-storage`).
 - **`control`** on `upload` (resumable) — pass an `UploadControl` (exported from `files-sdk`) to `pause()`/`resume()`/`abort()`, and persist `control.toJSON()` to resume in a later process after a crash. Requires a **known-length** body (no bare `ReadableStream`). Supported on S3-family, GCS, Firebase, Azure, OneDrive, Dropbox, and more; unsupported adapters throw. Distinct from `multipart` (this drives the provider's resumable session and exposes the upload id).
 - **`range`** on `download` — fetch a contiguous byte slice (`{ start, end? }`, 0-based, `end` inclusive — HTTP `Range` semantics, not `slice()`). The primitive behind video seeking and resuming. **Throws** on adapters with no range primitive (check `files.capabilities.rangeRead`).
 - **`onProgress`** on `upload` — `({ loaded, total? }) => void`. S3-family reports true byte-level progress (via the optional `@aws-sdk/lib-storage` peer dep).
@@ -234,7 +234,7 @@ Use this for provider features that aren't in the unified API (versioning, lifec
 
 Always check the live list and per-adapter options at <https://files-sdk.dev> (or the bundled `docs/adapters/`) rather than guessing. The `exports` map in `node_modules/files-sdk/package.json` is authoritative for what subpaths exist, and `files-sdk/providers` exports the same catalog as data (`PROVIDERS`, `getProvider(slug)`, each adapter's env vars and required config).
 
-S3-compatible wrappers need the `@aws-sdk/*` peers. On Cloudflare Workers (or anywhere you want no AWS SDK), use `files-sdk/s3-fetch` (`s3Fetch()`, a SigV4 `fetch` engine) or `client: "fetch"` on `r2()` / `minio()` / `rustfs()` — `r2` picks it automatically inside Workers. The fetch engine has no multipart/resumable uploads.
+S3-compatible wrappers need the `@aws-sdk/*` peers. On Cloudflare Workers (or anywhere you want no AWS SDK), use `files-sdk/s3-fetch` (`s3Fetch()`, a SigV4 `fetch` engine) or `client: "fetch"` on `r2()` / `minio()` / `rustfs()` — `r2` picks it automatically inside Workers. The fetch engine has no resumable uploads; it does multipart itself.
 
 ## Plugins
 
