@@ -20,6 +20,8 @@ const makeAdapter = (
     ...overrides,
   });
 
+const AWS_ENDPOINT = "https://s3.us-east-1.amazonaws.com";
+
 const withFake = (overrides: Partial<S3FetchAdapterOptions> = {}) => {
   const fake = makeFakeS3();
   const adapter = makeAdapter({ fetch: fake.fetchImpl, ...overrides });
@@ -53,6 +55,31 @@ describe("s3-fetch core — identity", () => {
     expect(adapter.name).toBe("s3-fetch");
     expect(adapter.raw).toBeInstanceOf(AwsClient);
     expect(adapter.bucket).toBe("uploads");
+  });
+
+  test("signedFetch signs with the adapter's keys and sends through its fetch", async () => {
+    const { adapter, fake } = withFake();
+    fake.seed("a b.txt", "one");
+    const res = await adapter.signedFetch(
+      `${adapter.endpoint}/uploads/a%20b.txt?versionId=v1`,
+      { method: "HEAD" }
+    );
+    expect(res.status).toBe(200);
+    const sent = fake.requests.at(-1);
+    expect(sent?.method).toBe("HEAD");
+    expect(sent?.url).toBe(
+      "https://acct.r2.cloudflarestorage.com/uploads/a%20b.txt?versionId=v1"
+    );
+    expect(sent?.headers.get("authorization")).toMatch(
+      /^AWS4-HMAC-SHA256 Credential=AKID\//u
+    );
+    const down = await expectCode(
+      makeAdapter({
+        fetch: () => Promise.reject(new TypeError("fetch failed")),
+      }).signedFetch(`${adapter.endpoint}/uploads/a`),
+      "Provider"
+    );
+    expect(down.message).toMatch(/fetch failed/u);
   });
 
   test("name override and capability flags", () => {
@@ -1438,16 +1465,33 @@ describe("s3-fetch core — multipart uploads", () => {
 describe("s3-fetch core — conditional writes", () => {
   test("off for an S3-compatible endpoint unless opted in; on for AWS", () => {
     expect(makeAdapter().conditional).toBeUndefined();
-    expect(
-      makeAdapter({ endpoint: "https://s3.us-east-1.amazonaws.com" })
-        .conditional
-    ).toBeDefined();
-    const adapter = makeAdapter({ conditional: true });
-    expect(new Files({ adapter }).capabilities.conditional).toMatchObject({
-      copy: { destinationCreate: true, destinationReplace: true },
+    const aws = makeAdapter({ endpoint: AWS_ENDPOINT });
+    expect(new Files({ adapter: aws }).capabilities.conditional).toMatchObject({
+      copy: {
+        atomicSourceDestination: true,
+        destinationCreate: true,
+        destinationReplace: true,
+      },
       create: true,
       replace: true,
     });
+    // Opted in on R2: create and replace, but no conditional copy, since R2's
+    // destination check is not atomic with the source pin.
+    const adapter = makeAdapter({ conditional: true });
+    expect(new Files({ adapter }).capabilities.conditional).toMatchObject({
+      copy: {
+        atomicSourceDestination: false,
+        destinationCreate: false,
+        destinationReplace: false,
+      },
+      create: true,
+      replace: true,
+    });
+    expect(
+      new Files({
+        adapter: makeAdapter({ conditional: false, endpoint: AWS_ENDPOINT }),
+      }).capabilities.conditional.copy.destinationCreate
+    ).toBe(false);
     expect(adapter.endpoint).toBe("https://acct.r2.cloudflarestorage.com");
     expect(adapter.forcePathStyle).toBe(true);
     expect(makeAdapter({ forcePathStyle: undefined }).forcePathStyle).toBe(
@@ -1534,7 +1578,9 @@ describe("s3-fetch core — conditional writes", () => {
     expect(fake.uploads.size).toBe(0);
     fake.seed("src.txt", "source");
     await expectCode(
-      files.copy("src.txt", "dst.txt", {
+      new Files({
+        adapter: makeAdapter({ endpoint: AWS_ENDPOINT, fetch: fake.fetchImpl }),
+      }).copy("src.txt", "dst.txt", {
         condition: {
           destination: { type: "create" },
           source: { etag: fake.store.get("src.txt")?.etag ?? "" },
@@ -1544,8 +1590,25 @@ describe("s3-fetch core — conditional writes", () => {
     );
   });
 
-  test("copy pins the source ETag and honors the destination predicate", async () => {
+  test("a conditional copy is refused off AWS, before any request", async () => {
     const { adapter, fake } = withFake({ conditional: true });
+    fake.seed("src.txt", "source");
+    const sent = fake.requests.length;
+    await expectCode(
+      new Files({ adapter }).copy("src.txt", "dst.txt", {
+        condition: {
+          destination: { type: "create" },
+          source: { etag: fake.store.get("src.txt")?.etag ?? "" },
+        },
+      }),
+      "Unsupported"
+    );
+    expect(fake.requests.length).toBe(sent);
+    expect(fake.store.has("dst.txt")).toBe(false);
+  });
+
+  test("copy pins the source ETag and honors the destination predicate", async () => {
+    const { adapter, fake } = withFake({ endpoint: AWS_ENDPOINT });
     const files = new Files({ adapter });
     const source = await files.upload("src.txt", "source");
     const sourceEtag = source.etag ?? "";
@@ -1607,7 +1670,7 @@ describe("s3-fetch core — conditional writes", () => {
             )
           : undefined;
       },
-      { conditional: true }
+      { endpoint: AWS_ENDPOINT }
     );
     const error = await expectCode(
       new Files({ adapter }).copy("huge.bin", "copy.bin", {

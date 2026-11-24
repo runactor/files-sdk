@@ -284,6 +284,9 @@ export const makeFakeS3 = (bucket = "uploads"): FakeS3 => {
     if (flags.conditionalNotImplemented && hasPredicate(request.headers)) {
       return notImplemented();
     }
+    // AWS's contract: a CopyObject's destination `If-None-Match` / `If-Match`
+    // and its `x-amz-copy-source-if-match` are checked in the one request
+    // that commits it. Only an AWS-endpoint adapter advertises the copy.
     if (!holds(request.headers, store.get(key))) {
       return precondition();
     }

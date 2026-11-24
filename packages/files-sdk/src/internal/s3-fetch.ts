@@ -17,6 +17,7 @@ import { AwsClient } from "aws4fetch";
 
 import type {
   Adapter,
+  AdapterConditionalCopy,
   AdapterUploadOptions,
   Body,
   ConditionalUploadResult,
@@ -78,10 +79,13 @@ export interface S3FetchAdapterOptions {
   /** SigV4 signing region. Defaults to `us-east-1`; R2 uses `auto`. */
   region?: string;
   /**
-   * Whether to expose the native conditional primitives: create
-   * (`If-None-Match: *`), replace (`If-Match`), and a copy pinned to the
-   * source's ETag. Defaults to `true` only for an AWS endpoint; an
-   * S3-compatible service is opted in once it is known to honor the headers.
+   * Whether to expose the native conditional writes: create
+   * (`If-None-Match: *`) and replace (`If-Match`). Defaults to `true` only for
+   * an AWS endpoint; an S3-compatible service is opted in once it is known to
+   * honor the headers. The conditional copy is AWS's alone, whatever this
+   * says: it promises the source pin and the destination predicate settle in
+   * one step, which R2 documents it does not do and other S3-compatible
+   * services don't document.
    */
   conditional?: boolean;
   accessKeyId: string;
@@ -114,6 +118,15 @@ export type S3FetchAdapter = Adapter<AwsClient> & {
   readonly endpoint: string;
   /** Whether requests address the bucket path-style. */
   readonly forcePathStyle: boolean;
+  /**
+   * Sign a request to this endpoint with the adapter's credentials and send
+   * it through the adapter's `fetch`, for the S3 calls the `Adapter` surface
+   * has no verb for (listing object versions, a version's GET, HEAD and
+   * DELETE, listing and aborting multipart uploads). `raw.fetch` signs the
+   * same way but always sends through the global `fetch`, so a host's
+   * `fetch` option (a bound, proxied, or instrumented client) never sees it.
+   */
+  signedFetch: (url: string, init?: RequestInit) => Promise<Response>;
 };
 
 const DEFAULT_CONTENT_TYPE = "application/octet-stream";
@@ -990,60 +1003,71 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
     };
   };
 
+  // AWS evaluates CopyObject's `x-amz-copy-source-if-match` and its
+  // destination `If-None-Match` / `If-Match` in the one request that commits
+  // the copy. R2 checks the source when it selects it and its own destination
+  // headers (`cf-copy-destination-if-*`) when it commits, and documents the two
+  // as not atomic; other S3-compatible services document neither. So
+  // `conditional` opts an endpoint into create and replace, and the copy stays
+  // AWS's.
+  const conditionalCopy: AdapterConditionalCopy | undefined = awsHost
+    ? {
+        atomicSourceDestination: true,
+        destinationCreate: true,
+        destinationReplace: true,
+        async run(
+          from: string,
+          to: string,
+          condition: CopyCondition,
+          operationOpts
+        ): Promise<void> {
+          const predicate = destinationPredicate(condition.destination);
+          const res = await send("PUT", objectUrl(to), {
+            headers: {
+              "x-amz-copy-source": copySource(from),
+              "x-amz-copy-source-if-match": quoteCanonicalEtag(
+                condition.source.etag
+              ),
+              ...predicate,
+            },
+            ...(operationOpts?.signal && { signal: operationOpts.signal }),
+          });
+          await assertImplemented(res, predicate);
+          if (res.ok) {
+            await readWriteResult(res);
+            return;
+          }
+          const xml = await drainText(res);
+          const rawCode = XML_CODE_RE.exec(xml)?.groups?.value;
+          const failure = errorFromXml(xml, res.status);
+          // The destination predicate rides one CopyObject request, so a
+          // source past its 5 GiB ceiling is refused, not split up.
+          if (
+            await oversizedCopySource(
+              from,
+              {
+                code: rawCode && decodeXmlText(rawCode),
+                status: res.status,
+              },
+              operationOpts
+            )
+          ) {
+            throw new FilesError(
+              "Unsupported",
+              `${providerLabel}: a conditional copy is one CopyObject request, which S3 limits to 5 GiB sources; "${from}" is larger`,
+              failure
+            );
+          }
+          throw failure;
+        },
+        sourceEtag: true,
+      }
+    : undefined;
+
   const conditional: S3FetchAdapter["conditional"] =
     (opts.conditional ?? awsHost)
       ? {
-          copy: {
-            atomicSourceDestination: true,
-            destinationCreate: true,
-            destinationReplace: true,
-            async run(
-              from: string,
-              to: string,
-              condition: CopyCondition,
-              operationOpts
-            ): Promise<void> {
-              const predicate = destinationPredicate(condition.destination);
-              const res = await send("PUT", objectUrl(to), {
-                headers: {
-                  "x-amz-copy-source": copySource(from),
-                  "x-amz-copy-source-if-match": quoteCanonicalEtag(
-                    condition.source.etag
-                  ),
-                  ...predicate,
-                },
-                ...(operationOpts?.signal && { signal: operationOpts.signal }),
-              });
-              await assertImplemented(res, predicate);
-              if (res.ok) {
-                await readWriteResult(res);
-                return;
-              }
-              const xml = await drainText(res);
-              const rawCode = XML_CODE_RE.exec(xml)?.groups?.value;
-              const failure = errorFromXml(xml, res.status);
-              // The destination predicate rides one CopyObject request, so a
-              // source past its 5 GiB ceiling is refused, not split up.
-              if (
-                await oversizedCopySource(
-                  from,
-                  {
-                    code: rawCode && decodeXmlText(rawCode),
-                    status: res.status,
-                  },
-                  operationOpts
-                )
-              ) {
-                throw new FilesError(
-                  "Unsupported",
-                  `${providerLabel}: a conditional copy is one CopyObject request, which S3 limits to 5 GiB sources; "${from}" is larger`,
-                  failure
-                );
-              }
-              throw failure;
-            },
-            sourceEtag: true,
-          },
+          ...(conditionalCopy && { copy: conditionalCopy }),
           create: (key, body, uploadOpts) =>
             conditionalWrite(key, body, { type: "create" }, uploadOpts),
           replace: (key, body, etag, uploadOpts) =>
@@ -1198,6 +1222,13 @@ export const s3FetchAdapter = (opts: S3FetchAdapterOptions): S3FetchAdapter => {
     },
     name: opts.name ?? "s3-fetch",
     raw: client,
+    async signedFetch(url, init) {
+      try {
+        return await fetchImpl(await client.sign(url, init));
+      } catch (error) {
+        throw mapError(error);
+      }
+    },
     async signedUploadUrl(key, signOpts: SignUploadOptions) {
       if (signOpts.maxSize !== undefined) {
         // `Unsupported`: enforcing maxSize needs a presigned POST policy,

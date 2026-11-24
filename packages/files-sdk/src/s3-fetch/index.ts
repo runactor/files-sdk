@@ -31,14 +31,18 @@ export interface S3FetchAdapterOptions {
    */
   region?: string;
   /**
-   * Expose the native conditional primitives: `upload({ condition })` as
+   * Expose the native conditional writes: `upload({ condition })` as
    * `If-None-Match: *` (create) or `If-Match` (replace), on a single PUT or
-   * on the CompleteMultipartUpload of a stream body past one part, and
-   * `copy({ condition })` as a CopyObject pinned to the source's ETag.
-   * Defaults to `true` only for an AWS endpoint (`amazonaws.com`,
-   * `amazonaws.com.cn`); set it for an S3-compatible service you know honors
-   * the headers (R2 does; Backblaze B2 answers them `501`, which surfaces as
-   * `Unsupported`).
+   * on the CompleteMultipartUpload of a stream body past one part. Defaults
+   * to `true` only for an AWS endpoint (`amazonaws.com`, `amazonaws.com.cn`);
+   * set it for an S3-compatible service you know honors the headers (R2 does;
+   * Backblaze B2 answers them `501`, which surfaces as `Unsupported`).
+   *
+   * `copy({ condition })`, a CopyObject pinned to the source's ETag with the
+   * destination predicate, is AWS's only: it promises both settle in one
+   * step, which R2 documents it does not do (its destination headers are its
+   * own and checked apart from the source's) and other services don't
+   * document. Elsewhere a conditional copy rejects with `Unsupported`.
    */
   conditional?: boolean;
   /**
@@ -82,7 +86,8 @@ export interface S3FetchAdapterOptions {
   /**
    * Override the `fetch` implementation used for every request — for tests,
    * or runtimes that hand out a bound/instrumented fetch. Defaults to
-   * `globalThis.fetch`.
+   * `globalThis.fetch`. The adapter's `signedFetch` sends through it too;
+   * `raw.fetch` (aws4fetch's own) does not.
    */
   fetch?: (request: Request) => Promise<Response>;
 }

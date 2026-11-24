@@ -2880,6 +2880,17 @@ export class Files<A extends Adapter = Adapter> {
   }
 
   /**
+   * The plugins wrapping this instance, in `plugins` order (outermost first),
+   * or `[]`. Code that reaches the store beside the instance (through
+   * {@link Files.adapter} or {@link Files.raw}) skips every plugin, so it
+   * checks this list and refuses a plugin whose transform or rerouting it
+   * can't follow, rather than bypass it silently.
+   */
+  get plugins(): readonly FilesPlugin[] {
+    return this.#plugins ?? [];
+  }
+
+  /**
    * `true` on a read-only instance — one built with `readonly: true`, or
    * returned by {@link Files.readonly} — whose write verbs throw `ReadOnly`.
    * Plugins whose `extend` methods write through an internal {@link Files}

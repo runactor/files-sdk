@@ -71,7 +71,7 @@ Same coverage and limits as the R2 fetch client: `upload`, `download` (including
 - `signedUploadUrl()` returns a presigned PUT; `maxSize` and a positive `minSize` throw because enforcing either needs a presigned POST policy this engine doesn't implement. Enforce upload caps at your application gateway instead.
 - Keys containing `.` or `..` path segments are rejected - URL normalization would silently sign a request for a different key.
 - Byte-level `onProgress` reporting falls back to the SDK's generic reporting.
-- [Conditional operations](/docs/conditional-operations) cover create, replace, and copy (no exact reads or conditional deletes). They are on for an AWS endpoint and off elsewhere unless `conditional: true` is passed. A stream body past one part carries the predicate on `CompleteMultipartUpload`. An endpoint that answers the headers with `501` (Backblaze B2) rejects with `Unsupported`.
+- [Conditional operations](/docs/conditional-operations) cover create and replace, and on AWS copy (no exact reads or conditional deletes). They are on for an AWS endpoint and off elsewhere unless `conditional: true` is passed, which opts in create and replace only: a conditional copy promises the source pin and the destination predicate settle in one step, which R2 documents it does not do. The adapter's `signedFetch(url, init)` signs a request with its keys and sends it through its `fetch`, for S3 calls with no `Files` verb (object versions, multipart listings). A stream body past one part carries the predicate on `CompleteMultipartUpload`. An endpoint that answers the headers with `501` (Backblaze B2) rejects with `Unsupported`.
 - On a versioned bucket, `upload()`, `head()`, and `download()` report the object's `version` (`x-amz-version-id`), and the adapter exposes its `endpoint` origin and `forcePathStyle` next to `raw`.
 - `files.raw` is the aws4fetch `AwsClient`, not an `S3Client`.
 
@@ -98,4 +98,4 @@ S3's own [limits](/docs/adapters/s3#limits) apply here too: presigned URLs live 
 | `copy` | ✅ |  |
 | `url` | ✅ |  |
 | `signedUploadUrl` | ⚠️ | PUT URL only - `maxSize` and a positive `minSize` throw (no presigned POST policy). |
-| conditional operations | ⚠️ | Create, replace, and copy, with `conditional: true` (default on AWS). |
+| conditional operations | ⚠️ | Create and replace with `conditional: true` (default on AWS); copy on AWS only. |

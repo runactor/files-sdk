@@ -3155,6 +3155,14 @@ describe("isReadOnly", () => {
       new Files({ adapter: fakeAdapter(), readonly: true }).isReadOnly
     ).toBe(true);
   });
+
+  test("plugins lists the instance's plugins, carried into readonly() clones", () => {
+    const audit: FilesPlugin = { name: "audit", wrap: (op, next) => next(op) };
+    expect(new Files({ adapter: fakeAdapter() }).plugins).toEqual([]);
+    const files = new Files({ adapter: fakeAdapter(), plugins: [audit] });
+    expect(files.plugins).toEqual([audit]);
+    expect(files.readonly().plugins).toEqual([audit]);
+  });
 });
 
 // Counts every adapter call so a test can prove a refusal came first.
